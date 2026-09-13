@@ -4,8 +4,12 @@ name: Release APK
 #   1. 推送 v* 标签（如 v1.0.0）-> 自动构建、签名，并创建 GitHub Release
 #   2. 在 Actions 页面手动 Run workflow（可指定上游 Rust 分支和版本号）
 #
+# 手动触发时可以勾选 “signing_only”，只跑签名 secrets 校验（不编译 Rust），
+# 用来快速定位 KeytoolException / toDerInputStream rejects tag type 之类的签名问题。
+# 本地预检：powershell -ExecutionPolicy Bypass -File scripts\verify-signing-secrets.ps1
+#
 # 必需 Secrets（Settings -> Secrets and variables -> Actions）
-#   RELEASE_KEYSTORE_BASE64    签名库的 base64（单行，无换行）
+#   RELEASE_KEYSTORE_BASE64    签名库 *.jks 本体的 base64（单行，无换行）
 #   RELEASE_KEYSTORE_PASSWORD  keystore 密码
 #   RELEASE_KEY_ALIAS          key 别名
 #   RELEASE_KEY_PASSWORD       key 密码
@@ -20,10 +24,14 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
+      signing_only:
+        description: '只校验签名 secrets（跳过 Rust 构建，约 1 分钟）'
+        type: boolean
+        default: false
       rust_ref:
         description: '上游 Rust 仓库 (yixinin/nexapipe) 的分支 / tag / commit'
         required: false
-        default: 'feat-proxy'
+        default: 'main'
       version_name:
         description: 'versionName 覆盖值（留空则自动生成 0.0.<run_number>）'
         required: false
@@ -60,10 +68,18 @@ jobs:
           INPUT_RUST_REF: ${{ inputs.rust_ref }}
           INPUT_VERSION_NAME: ${{ inputs.version_name }}
           INPUT_RUST_FEATURES: ${{ inputs.rust_features }}
+          INPUT_SIGNING_ONLY: ${{ inputs.signing_only }}
         run: |
           set -euo pipefail
-          RUST_REF="${INPUT_RUST_REF:-feat-proxy}"
+          RUST_REF="${INPUT_RUST_REF:-main}"
           RUST_FEATURES="${INPUT_RUST_FEATURES:-jni local-proxy tun-proxy}"
+
+          # push / 非 dispatch 触发时 inputs 为空，默认跑完整流程
+          if [ "${INPUT_SIGNING_ONLY:-false}" = "true" ]; then
+            SKIP_RUST=true
+          else
+            SKIP_RUST=false
+          fi
 
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             VERSION_NAME="${GITHUB_REF_NAME#v}"
@@ -79,6 +95,7 @@ jobs:
             echo "rust_features=$RUST_FEATURES"
             echo "version_name=$VERSION_NAME"
             echo "version_code=${GITHUB_RUN_NUMBER}"
+            echo "skip_rust=$SKIP_RUST"
           } >> "$GITHUB_OUTPUT"
 
           {
@@ -99,9 +116,11 @@ jobs:
           cache: gradle
 
       - name: Set up Android SDK
+        if: steps.opts.outputs.skip_rust != 'true'
         uses: android-actions/setup-android@v3
 
       - name: Install SDK platform, build-tools and NDK
+        if: steps.opts.outputs.skip_rust != 'true'
         run: |
           set -euo pipefail
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
@@ -112,6 +131,7 @@ jobs:
           echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
 
       - name: Checkout upstream Rust repo
+        if: steps.opts.outputs.skip_rust != 'true'
         uses: actions/checkout@v4
         with:
           repository: ${{ env.RUST_REPO }}
@@ -119,16 +139,19 @@ jobs:
           path: rust-src
 
       - name: Set up Rust toolchain
+        if: steps.opts.outputs.skip_rust != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ env.TARGET_TRIPLE }}
 
       - name: Install cargo-ndk
+        if: steps.opts.outputs.skip_rust != 'true'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-ndk
 
       - name: Cache cargo artifacts
+        if: steps.opts.outputs.skip_rust != 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -141,6 +164,7 @@ jobs:
             ${{ runner.os }}-cargo-${{ env.TARGET_TRIPLE }}-
 
       - name: Build libnexapipe_client.so
+        if: steps.opts.outputs.skip_rust != 'true'
         env:
           RUST_FEATURES: ${{ steps.opts.outputs.rust_features }}
         run: |
@@ -171,6 +195,7 @@ jobs:
           ls -lh "../app/src/main/jniLibs/${TARGET_ABI}/libnexapipe_client.so"
 
       - name: Verify native library exports
+        if: steps.opts.outputs.skip_rust != 'true'
         run: |
           set -euo pipefail
           SO="app/src/main/jniLibs/${TARGET_ABI}/libnexapipe_client.so"
@@ -193,20 +218,99 @@ jobs:
           done
           [ "$MISSING" -eq 0 ] || exit 1
 
+      # 把 RELEASE_KEYSTORE_BASE64 还原成 .jks，并在这一步就把「secret 内容不对 /
+      # 密码不对 / 别名不对」全部暴露出来 —— 否则错误会延迟到 Gradle 打包阶段，
+      # 报成 KeytoolException / toDerInputStream rejects tag type NNN，很难定位。
       - name: Prepare signing keystore
+        id: keystore
         env:
           RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
         run: |
           set -euo pipefail
-          if [ -z "${RELEASE_KEYSTORE_BASE64:-}" ]; then
-            echo "::error::缺少 secret RELEASE_KEYSTORE_BASE64，无法产出已签名的 release APK"
-            exit 1
-          fi
+          die() { echo "::error::$1"; exit 1; }
+
+          [ -n "${RELEASE_KEYSTORE_BASE64:-}" ] \
+            || die "缺少 secret RELEASE_KEYSTORE_BASE64（*.jks 本体的 base64）"
+
+          # 容忍粘贴时带进来的空白、换行、引号、反引号，以及 data URI 前缀
+          B64=$(printf '%s' "$RELEASE_KEYSTORE_BASE64" \
+                | tr -d "[:space:]" \
+                | tr -d "\"\`'" \
+                | sed 's/^data:[^,]*;base64,//')
+          [ -n "$B64" ] || die "secret RELEASE_KEYSTORE_BASE64 去掉空白后为空"
+          echo "secret 字符数: ${#RELEASE_KEYSTORE_BASE64}（清理空白后 ${#B64}）"
+
           mkdir -p "$RUNNER_TEMP/signing"
-          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/signing/release.jks"
-          echo "RELEASE_KEYSTORE_PATH=$RUNNER_TEMP/signing/release.jks" >> "$GITHUB_ENV"
+          KS="$RUNNER_TEMP/signing/release.jks"
+
+          # 正常解码失败时，再容忍夹杂的非法字符重试一次，交给下一步的文件头校验兜底
+          if ! printf '%s' "$B64" | base64 -d > "$KS" 2>/dev/null; then
+            printf '%s' "$B64" | base64 -d -i > "$KS" 2>/dev/null \
+              || die "RELEASE_KEYSTORE_BASE64 不是合法 base64（清理后长度 ${#B64}）"
+          fi
+
+          SIZE=$(stat -c %s "$KS")
+          MAGIC=$(od -A n -t x1 -N 4 "$KS" | tr -d ' \n')
+          SHA=$(sha256sum "$KS" | cut -d' ' -f1)
+          echo "解码结果: ${SIZE} 字节, 文件头 0x${MAGIC}, sha256 ${SHA}"
+
+          case "$MAGIC" in
+            3082*|30*) ;;      # PKCS12（DER SEQUENCE）
+            feedfeed) ;;       # 老式 JKS
+            *)
+              echo "::error::RELEASE_KEYSTORE_BASE64 解码后不是密钥库（文件头 0x${MAGIC}，期望 0x3082… 或 0xfeedfeed）"
+              echo "---------- 解码结果首 32 字节 ----------"
+              od -A d -t x1z -N 32 "$KS" || true
+              echo "--------------------------------------"
+              echo "这个 secret 必须是 *.jks 文件【本体】的 base64：单行、约几千字符、以 MII 开头。"
+              echo "常见错误：填成了文件路径 / 密码 / base64 那一行的路径 / 别的文件的 base64。"
+              exit 1
+              ;;
+          esac
+          [ "$SIZE" -gt 1000 ] || die "解码后的密钥库只有 ${SIZE} 字节，明显不完整"
+
+          # 用 keytool 提前验证密码与别名，比等 Gradle 打包失败快得多
+          if [ -n "${RELEASE_KEYSTORE_PASSWORD:-}" ]; then
+            ALIAS_ARGS=""
+            if [ -n "${RELEASE_KEY_ALIAS:-}" ]; then
+              ALIAS_ARGS="-alias ${RELEASE_KEY_ALIAS}"
+            fi
+            if ! keytool -list -keystore "$KS" \
+                   -storepass "$RELEASE_KEYSTORE_PASSWORD" $ALIAS_ARGS \
+                   > /dev/null 2> "$RUNNER_TEMP/keytool.err"; then
+              cat "$RUNNER_TEMP/keytool.err"
+              die "keytool 读不出密钥库：检查 RELEASE_KEYSTORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD"
+            fi
+            echo "keytool 校验通过：密码与别名 ${RELEASE_KEY_ALIAS:-<未指定>} 均正确"
+          else
+            echo "::warning::未设置 RELEASE_KEYSTORE_PASSWORD，跳过 keytool 预校验"
+          fi
+
+          {
+            echo ""
+            echo "### 签名库校验"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 大小 | ${SIZE} 字节 |"
+            echo "| 文件头 | \`0x${MAGIC}\` |"
+            echo "| sha256 | \`${SHA}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "keystore_sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_KEYSTORE_PATH=$KS" >> "$GITHUB_ENV"
+
+      - name: Signing check only
+        if: steps.opts.outputs.skip_rust == 'true'
+        run: |
+          set -euo pipefail
+          echo "signing_only=true：签名 secrets 校验通过，已跳过 Rust 构建 / 打包 / 发布。"
+          echo "keystore sha256: ${{ steps.keystore.outputs.keystore_sha256 }}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Assemble signed release APK
+        if: steps.opts.outputs.skip_rust != 'true'
         env:
           RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
@@ -220,6 +324,7 @@ jobs:
 
       - name: Verify APK signature and stage artifact
         id: apk
+        if: steps.opts.outputs.skip_rust != 'true'
         run: |
           set -euo pipefail
           APK=$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' | sort | head -n 1)
@@ -241,6 +346,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload APK artifact
+        if: steps.opts.outputs.skip_rust != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: nexapipe-release-apk-${{ steps.opts.outputs.version_name }}
@@ -250,7 +356,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish GitHub Release
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' && steps.opts.outputs.skip_rust != 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: |
