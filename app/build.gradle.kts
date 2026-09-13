@@ -8,14 +8,17 @@ plugins {
 }
 
 // ---------------------------------------------------------------------------
-// Release 签名配置
+// Release signing configuration
 //
-// 取值优先级：keystore.properties（本地，已被 .gitignore 忽略）> 环境变量（CI）。
-// CI 由 .github/workflows/release-apk.yml 注入 RELEASE_KEYSTORE_PATH /
-// RELEASE_KEYSTORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD。
+// Value precedence: keystore.properties (local, ignored by .gitignore) >
+// environment variables (CI). The CI injects RELEASE_KEYSTORE_PATH /
+// RELEASE_KEYSTORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD from
+// .github/workflows/release-apk.yml.
 //
-// 没有任何签名信息时，release 构建不会被赋予 signingConfig（产出未签名 APK），
-// 但 assembleDebug 等日常任务不受影响；CI 侧会额外用 apksigner 校验签名。
+// When no signing information is available the release build is not assigned a
+// signingConfig (an unsigned APK is produced), but everyday tasks such as
+// assembleDebug are unaffected; CI additionally verifies the signature with
+// apksigner.
 // ---------------------------------------------------------------------------
 val keystorePropertiesFile = rootProject.file("keystore.properties")
 val keystoreProperties = Properties().apply {
@@ -65,8 +68,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // 仅当签名信息齐备时才绑定 signingConfig，避免本地无 keystore 时
-            // assembleDebug / 其他任务在配置阶段就报错。
+            // Only bind the signingConfig when the signing information is
+            // complete, so that assembleDebug and other tasks do not fail at
+            // configuration time when no keystore is available locally.
             signingConfigs.findByName("release")
                 ?.takeIf { it.storeFile != null }
                 ?.let { signingConfig = it }

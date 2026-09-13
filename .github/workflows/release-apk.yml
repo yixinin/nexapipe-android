@@ -1,22 +1,26 @@
 name: Release APK
 
-# 触发方式
-#   1. 推送 v* 标签（如 v1.0.0）-> 自动构建、签名，并创建 GitHub Release
-#   2. 在 Actions 页面手动 Run workflow（可指定上游 Rust 分支和版本号）
+# Triggers
+#   1. Push a v* tag (e.g. v1.0.0) -> build, sign and publish a GitHub Release
+#   2. Manual "Run workflow" from the Actions page (the upstream Rust ref and
+#      the version can be specified)
 #
-# 手动触发时可以勾选 “signing_only”，只跑签名 secrets 校验（不编译 Rust），
-# 用来快速定位 KeytoolException / toDerInputStream rejects tag type 之类的签名问题。
-# 本地预检：powershell -ExecutionPolicy Bypass -File scripts\verify-signing-secrets.ps1
+# When triggered manually you can tick "signing_only" to run only the signing
+# secrets validation (without compiling Rust), which makes it quick to locate
+# signing problems such as KeytoolException / toDerInputStream rejects tag type.
+# Local pre-flight check:
+#   powershell -ExecutionPolicy Bypass -File scripts\verify-signing-secrets.ps1
 #
-# 必需 Secrets（Settings -> Secrets and variables -> Actions）
-#   RELEASE_KEYSTORE_BASE64    签名库 *.jks 本体的 base64（单行，无换行）
-#   RELEASE_KEYSTORE_PASSWORD  keystore 密码
-#   RELEASE_KEY_ALIAS          key 别名
-#   RELEASE_KEY_PASSWORD       key 密码
+# Required secrets (Settings -> Secrets and variables -> Actions)
+#   RELEASE_KEYSTORE_BASE64    base64 of the *.jks keystore itself (one line)
+#   RELEASE_KEYSTORE_PASSWORD  keystore password
+#   RELEASE_KEY_ALIAS          key alias
+#   RELEASE_KEY_PASSWORD       key password
 #
-# 原生库来源：ui-android 仓库不保存 libnexapipe_client.so（app/.gitignore 已忽略
-# app/src/main/jniLibs/）。workflow 会拉取上游公开仓库 yixinin/nexapipe 并用
-# cargo-ndk 交叉编译出 arm64-v8a 的 .so，再交给 Gradle 打包。
+# Where the native library comes from: the ui-android repo does not keep
+# libnexapipe_client.so (app/.gitignore excludes app/src/main/jniLibs/). This
+# workflow checks out the public upstream repo yixinin/nexapipe, cross-compiles
+# the arm64-v8a .so with cargo-ndk and hands it to Gradle.
 
 on:
   push:
@@ -25,19 +29,19 @@ on:
   workflow_dispatch:
     inputs:
       signing_only:
-        description: '只校验签名 secrets（跳过 Rust 构建，约 1 分钟）'
+        description: 'Verify the signing secrets only (skips the Rust build, about 1 minute)'
         type: boolean
         default: false
       rust_ref:
-        description: '上游 Rust 仓库 (yixinin/nexapipe) 的分支 / tag / commit'
+        description: 'Branch / tag / commit of the upstream Rust repo (yixinin/nexapipe)'
         required: false
         default: 'main'
       version_name:
-        description: 'versionName 覆盖值（留空则自动生成 0.0.<run_number>）'
+        description: 'Override for versionName (leave empty to auto-generate 0.0.<run_number>)'
         required: false
         default: ''
       rust_features:
-        description: 'nexapipe-client 的 cargo features（必须含 tun-proxy，否则 APK 缺少 TUN JNI 符号）'
+        description: 'Cargo features for nexapipe-client (must include tun-proxy, otherwise the APK misses the TUN JNI symbols)'
         required: false
         default: 'jni local-proxy tun-proxy'
 
@@ -74,7 +78,8 @@ jobs:
           RUST_REF="${INPUT_RUST_REF:-main}"
           RUST_FEATURES="${INPUT_RUST_FEATURES:-jni local-proxy tun-proxy}"
 
-          # push / 非 dispatch 触发时 inputs 为空，默认跑完整流程
+          # Inputs are empty on push / non-dispatch runs, so the full flow runs
+          # by default.
           if [ "${INPUT_SIGNING_ONLY:-false}" = "true" ]; then
             SKIP_RUST=true
           else
@@ -101,9 +106,9 @@ jobs:
           {
             echo "### nexapipe $VERSION_NAME (versionCode ${GITHUB_RUN_NUMBER})"
             echo ""
-            echo "| 项 | 值 |"
+            echo "| Item | Value |"
             echo "| --- | --- |"
-            echo "| Rust 仓库 | \`${RUST_REPO}\` @ \`${RUST_REF}\` |"
+            echo "| Rust repo | \`${RUST_REPO}\` @ \`${RUST_REF}\` |"
             echo "| cargo features | \`${RUST_FEATURES}\` |"
             echo "| ABI | \`${TARGET_ABI}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -172,14 +177,15 @@ jobs:
           NDK_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
           LINKER="${NDK_BIN}/${TARGET_TRIPLE}${MIN_SDK}-clang"
           if [ ! -x "$LINKER" ]; then
-            echo "::error::找不到 NDK 链接器 $LINKER"
+            echo "::error::NDK linker not found: $LINKER"
             ls -1 "$NDK_BIN" | grep -E 'clang$' || true
             exit 1
           fi
 
-          # 上游 .cargo/config.toml 里写死了 Windows 的 NDK linker 路径。
-          # 这里用 --config 在命令行覆盖（优先级高于环境变量和 config 文件），
-          # 保证 Linux runner 用到正确的 clang。
+          # The upstream .cargo/config.toml hardcodes a Windows NDK linker path.
+          # Override it on the command line with --config (which takes
+          # precedence over both environment variables and the config file) so
+          # the Linux runner uses the right clang.
           cd rust-src
           cargo ndk \
             --target "${TARGET_ABI}" \
@@ -199,7 +205,7 @@ jobs:
         run: |
           set -euo pipefail
           SO="app/src/main/jniLibs/${TARGET_ABI}/libnexapipe_client.so"
-          test -f "$SO" || { echo "::error file=$SO::原生库不存在"; exit 1; }
+          test -f "$SO" || { echo "::error file=$SO::Native library not found"; exit 1; }
 
           NM="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
           SYMS=$("$NM" -D --defined-only "$SO" \
@@ -212,15 +218,17 @@ jobs:
                     nativeStartProxyLegacy nativeStopProxy nativeAddNode nativeStartTunProxy \
                     nativeStopTunProxy nativeDestroy; do
             if ! echo "$SYMS" | grep -qx "Java_com_nexa_pipe_IrohProxy_${FN}"; then
-              echo "::error::libnexapipe_client.so 缺少 JNI 符号 ${FN}（检查 cargo features 是否包含 tun-proxy）"
+              echo "::error::libnexapipe_client.so is missing the JNI symbol ${FN} (check that the cargo features include tun-proxy)"
               MISSING=1
             fi
           done
           [ "$MISSING" -eq 0 ] || exit 1
 
-      # 把 RELEASE_KEYSTORE_BASE64 还原成 .jks，并在这一步就把「secret 内容不对 /
-      # 密码不对 / 别名不对」全部暴露出来 —— 否则错误会延迟到 Gradle 打包阶段，
-      # 报成 KeytoolException / toDerInputStream rejects tag type NNN，很难定位。
+      # Restore RELEASE_KEYSTORE_BASE64 into a .jks file and surface every
+      # problem (wrong secret content / wrong password / wrong alias) right
+      # here. Otherwise the failure is deferred to the Gradle packaging step and
+      # reported as KeytoolException / toDerInputStream rejects tag type NNN,
+      # which is very hard to trace back.
       - name: Prepare signing keystore
         id: keystore
         env:
@@ -232,46 +240,52 @@ jobs:
           die() { echo "::error::$1"; exit 1; }
 
           [ -n "${RELEASE_KEYSTORE_BASE64:-}" ] \
-            || die "缺少 secret RELEASE_KEYSTORE_BASE64（*.jks 本体的 base64）"
+            || die "Missing secret RELEASE_KEYSTORE_BASE64 (base64 of the *.jks keystore itself)"
 
-          # 容忍粘贴时带进来的空白、换行、引号、反引号，以及 data URI 前缀
+          # Tolerate whitespace, newlines, quotes, backticks and a data URI
+          # prefix that may have been picked up while pasting.
           B64=$(printf '%s' "$RELEASE_KEYSTORE_BASE64" \
                 | tr -d "[:space:]" \
                 | tr -d "\"\`'" \
                 | sed 's/^data:[^,]*;base64,//')
-          [ -n "$B64" ] || die "secret RELEASE_KEYSTORE_BASE64 去掉空白后为空"
-          echo "secret 字符数: ${#RELEASE_KEYSTORE_BASE64}（清理空白后 ${#B64}）"
+          [ -n "$B64" ] || die "Secret RELEASE_KEYSTORE_BASE64 is empty after stripping whitespace"
+          echo "Secret character count: ${#RELEASE_KEYSTORE_BASE64} (${#B64} after stripping whitespace)"
 
           mkdir -p "$RUNNER_TEMP/signing"
           KS="$RUNNER_TEMP/signing/release.jks"
 
-          # 正常解码失败时，再容忍夹杂的非法字符重试一次，交给下一步的文件头校验兜底
+          # If plain decoding fails, retry once while tolerating stray invalid
+          # characters and let the file-header check below be the final guard.
           if ! printf '%s' "$B64" | base64 -d > "$KS" 2>/dev/null; then
             printf '%s' "$B64" | base64 -d -i > "$KS" 2>/dev/null \
-              || die "RELEASE_KEYSTORE_BASE64 不是合法 base64（清理后长度 ${#B64}）"
+              || die "RELEASE_KEYSTORE_BASE64 is not valid base64 (length after cleanup: ${#B64})"
           fi
 
           SIZE=$(stat -c %s "$KS")
           MAGIC=$(od -A n -t x1 -N 4 "$KS" | tr -d ' \n')
           SHA=$(sha256sum "$KS" | cut -d' ' -f1)
-          echo "解码结果: ${SIZE} 字节, 文件头 0x${MAGIC}, sha256 ${SHA}"
+          echo "Decoded ${SIZE} bytes, file header 0x${MAGIC}, sha256 ${SHA}"
 
           case "$MAGIC" in
-            3082*|30*) ;;      # PKCS12（DER SEQUENCE）
-            feedfeed) ;;       # 老式 JKS
+            3082*|30*) ;;      # PKCS12 (DER SEQUENCE)
+            feedfeed) ;;       # legacy JKS
             *)
-              echo "::error::RELEASE_KEYSTORE_BASE64 解码后不是密钥库（文件头 0x${MAGIC}，期望 0x3082… 或 0xfeedfeed）"
-              echo "---------- 解码结果首 32 字节 ----------"
+              echo "::error::RELEASE_KEYSTORE_BASE64 does not decode to a keystore (file header 0x${MAGIC}, expected 0x3082... or 0xfeedfeed)"
+              echo "---------- First 32 decoded bytes ----------"
               od -A d -t x1z -N 32 "$KS" || true
               echo "--------------------------------------"
-              echo "这个 secret 必须是 *.jks 文件【本体】的 base64：单行、约几千字符、以 MII 开头。"
-              echo "常见错误：填成了文件路径 / 密码 / base64 那一行的路径 / 别的文件的 base64。"
+              echo "This secret must be the base64 of the *.jks file ITSELF: a single line, a few thousand characters, starting with MII."
+              echo "Common mistakes: a file path / the password / the path of the base64 file / the base64 of some other file."
+              echo "If the character/byte count above looks far too small (this project's keystore is about 4.3 KB, i.e. about 5776 base64 characters),"
+              echo "it was almost certainly truncated while copying the single long line. Copy the whole thing with this command instead of selecting it by hand:"
+              echo "  Get-Content <base64-file> -Raw | Set-Clipboard"
               exit 1
               ;;
           esac
-          [ "$SIZE" -gt 1000 ] || die "解码后的密钥库只有 ${SIZE} 字节，明显不完整"
+          [ "$SIZE" -gt 1000 ] || die "The decoded keystore is only ${SIZE} bytes, obviously incomplete"
 
-          # 用 keytool 提前验证密码与别名，比等 Gradle 打包失败快得多
+          # Validate the password and the alias with keytool up front; that is
+          # far quicker than waiting for the Gradle packaging step to fail.
           if [ -n "${RELEASE_KEYSTORE_PASSWORD:-}" ]; then
             ALIAS_ARGS=""
             if [ -n "${RELEASE_KEY_ALIAS:-}" ]; then
@@ -281,21 +295,21 @@ jobs:
                    -storepass "$RELEASE_KEYSTORE_PASSWORD" $ALIAS_ARGS \
                    > /dev/null 2> "$RUNNER_TEMP/keytool.err"; then
               cat "$RUNNER_TEMP/keytool.err"
-              die "keytool 读不出密钥库：检查 RELEASE_KEYSTORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD"
+              die "keytool cannot read the keystore: check RELEASE_KEYSTORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD"
             fi
-            echo "keytool 校验通过：密码与别名 ${RELEASE_KEY_ALIAS:-<未指定>} 均正确"
+            echo "keytool check passed: password and alias ${RELEASE_KEY_ALIAS:-<unset>} are both correct"
           else
-            echo "::warning::未设置 RELEASE_KEYSTORE_PASSWORD，跳过 keytool 预校验"
+            echo "::warning::RELEASE_KEYSTORE_PASSWORD is not set, skipping the keytool pre-check"
           fi
 
           {
             echo ""
-            echo "### 签名库校验"
+            echo "### Signing keystore verification"
             echo ""
-            echo "| 项 | 值 |"
+            echo "| Item | Value |"
             echo "| --- | --- |"
-            echo "| 大小 | ${SIZE} 字节 |"
-            echo "| 文件头 | \`0x${MAGIC}\` |"
+            echo "| Size | ${SIZE} bytes |"
+            echo "| File header | \`0x${MAGIC}\` |"
             echo "| sha256 | \`${SHA}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -306,7 +320,7 @@ jobs:
         if: steps.opts.outputs.skip_rust == 'true'
         run: |
           set -euo pipefail
-          echo "signing_only=true：签名 secrets 校验通过，已跳过 Rust 构建 / 打包 / 发布。"
+          echo "signing_only=true: the signing secrets check passed; the Rust build / packaging / publishing steps were skipped."
           echo "keystore sha256: ${{ steps.keystore.outputs.keystore_sha256 }}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Assemble signed release APK
@@ -328,7 +342,7 @@ jobs:
         run: |
           set -euo pipefail
           APK=$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' | sort | head -n 1)
-          test -n "$APK" || { echo "::error::未找到 release APK"; exit 1; }
+          test -n "$APK" || { echo "::error::Release APK not found"; exit 1; }
 
           BUILD_TOOLS_DIR=$(ls -d "${ANDROID_SDK_ROOT}"/build-tools/* | sort -V | tail -n 1)
           "${BUILD_TOOLS_DIR}/apksigner" verify --verbose --print-certs "$APK"
@@ -338,7 +352,7 @@ jobs:
           sha256sum "$OUT" > "${OUT}.sha256"
 
           {
-            echo "### 产物"
+            echo "### Artifacts"
             echo '```'
             "${BUILD_TOOLS_DIR}/aapt2" dump badging "$OUT" | head -n 4
             cat "${OUT}.sha256"

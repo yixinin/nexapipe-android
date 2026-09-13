@@ -60,19 +60,23 @@ class VpnViewModel : ViewModel() {
     val twoFactorSecret = kotlinx.coroutines.flow.MutableStateFlow("")
     val twoFactorAlgorithm = kotlinx.coroutines.flow.MutableStateFlow("sha1") // "sha1", "sha256", "sha512"
 
-    // 串行化 connect/disconnect，避免并发 native 调用竞态。
+    // Serialize connect/disconnect so concurrent native calls cannot race.
     private val connectionMutex = Mutex()
-    // 持有 connect 协程句柄，disconnect 时可取消（JNI 不可中断，但下一挂起点会抛 CancellationException）。
+    // Keeps a handle on the connect coroutine so disconnect can cancel it
+    // (JNI cannot be interrupted, but the next suspension point throws
+    // CancellationException).
     private var connectJob: Job? = null
 
     companion object {
-        // 单次连接尝试的超时与重试参数。弱网下 iroh bind 可达 30s，留足预算。
+        // Timeout and retry parameters for a single connect attempt. iroh bind
+        // can take up to 30s on a weak network, so the budget is generous.
         private const val MAX_CONNECT_ATTEMPTS = 3
         private const val ATTEMPT_TIMEOUT_MS = 60_000L
         private const val DISCONNECT_MUTEX_TIMEOUT_MS = 70_000L
         private val BACKOFF_MS = longArrayOf(0, 1_000, 2_000)
-        // local proxy 监听端口（仅供 preConnect 预热用，TUN 模式下数据不走 local proxy）。
-        // 端口冲突时 startProxyWithRetries 会自动递增。
+        // Local proxy listening port (only used to warm up preConnect; in TUN
+        // mode data does not flow through the local proxy).
+        // startProxyWithRetries increments it automatically on a port conflict.
         private const val LOCAL_PROXY_PORT = 8080
     }
 
@@ -150,8 +154,9 @@ class VpnViewModel : ViewModel() {
     }
 
     /**
-     * 启动 iroh endpoint（若未启动）。nativeStartIroh 在 Rust 侧已有 30s 超时。
-     * 抛异常表示失败，由调用方决定是否重试。
+     * Starts the iroh endpoint if it is not up yet. nativeStartIroh already has
+     * a 30s timeout on the Rust side. Throwing means failure; the caller
+     * decides whether to retry.
      */
     private suspend fun ensureIrohStarted() {
         if (isIrohStarted.value) return
@@ -167,16 +172,22 @@ class VpnViewModel : ViewModel() {
     }
 
     /**
-     * 从 ConnectivityManager 获取系统 DNS 服务器列表（逗号分隔的 IP 字符串）。
+     * Reads the system DNS server list from ConnectivityManager and returns it
+     * as a comma-separated string of IPs.
      *
-     * iroh 默认在 Android 上通过 JNI 读取系统 DNS 会失败（Null pointer in call_method
-     * obj argument），回落到 Google DNS（8.8.8.8/8.8.4.4），国内不稳定导致后端连不上。
-     * 这里由 Kotlin 直接从 ConnectivityManager.getLinkProperties().dnsServers 获取系统 DNS，
-     * 传给 Rust 侧 nativeSetDnsServers，让 iroh 用自定义 DnsResolver 而非 JNI 路径。
+     * By default iroh fails to read the system DNS on Android through JNI
+     * ("Null pointer in call_method obj argument") and falls back to Google DNS
+     * (8.8.8.8/8.8.4.4), which is unreliable behind restrictive networks and
+     * leaves the backend unreachable. Instead, Kotlin reads the system DNS
+     * straight from ConnectivityManager.getLinkProperties().dnsServers and
+     * hands it to nativeSetDnsServers on the Rust side, so iroh uses a custom
+     * DnsResolver instead of the broken JNI path.
      *
-     * 始终优先选择已连接 WiFi；没有可用 WiFi 时才选择蜂窝网络。只读取该网络的 DNS，
-     * 避免 WiFi/蜂窝 DNS 混用。若系统 DNS 为空（极端情况），
-     * 回落到国内常用公共 DNS（AliDNS 223.5.5.5、114DNS 114.114.114.114）。
+     * A connected Wi-Fi network is always preferred; cellular is only picked
+     * when no usable Wi-Fi exists. Only that network's DNS is read, so Wi-Fi
+     * and cellular DNS are never mixed. If the system DNS list is empty (an
+     * edge case), fall back to public DNS servers that are widely reachable
+     * from mainland China (AliDNS 223.5.5.5, 114DNS 114.114.114.114).
      */
     private fun getSystemDnsServers(context: Context): String {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
@@ -191,7 +202,8 @@ class VpnViewModel : ViewModel() {
             )
         }
 
-        // 最终兜底：国内常用公共 DNS。小米 17 在国内使用，AliDNS + 114DNS 覆盖主流场景。
+        // Last-resort fallback: public DNS servers commonly reachable from
+        // mainland China. AliDNS + 114DNS cover the common cases.
         if (servers.isEmpty()) {
             addLog("No system DNS found, falling back to public DNS (223.5.5.5, 114.114.114.114)")
             servers.add("223.5.5.5")
@@ -202,17 +214,20 @@ class VpnViewModel : ViewModel() {
     }
 
     /**
-     * 预解析 iroh 基础设施域名的 IP，注入 Rust 侧 OverrideResolver。
+     * Pre-resolves the IPs of the iroh infrastructure domains and injects them
+     * into the OverrideResolver on the Rust side.
      *
-     * GFW 会丢弃 iroh.link 域名的 UDP DNS 响应，导致 iroh 内部 hickory 解析
-     * dns.iroh.link / *.relay.n0.iroh.link 超时。这里用系统 DNS（InetAddress，
-     * 可能走 DoT/Private DNS 绕过 GFW）预解析这些域名的 IP，构造
-     * "domain=ip1,ip2;domain2=ip3" 格式返回，供 connect() 传给 nativeSetDnsOverride。
-     * OverrideResolver 对这些域名直接返回预解析 IP，使 pkarr resolve（HTTPS to
-     * dns.iroh.link/pkarr/<z32>）和 relay 连接能成功。
+     * The Great Firewall (GFW) drops UDP DNS responses for iroh.link domains,
+     * so iroh's internal hickory resolver times out on dns.iroh.link and
+     * *.relay.n0.iroh.link. Those domains are pre-resolved here with the system
+     * DNS (InetAddress, which may go through DoT / Private DNS and bypass the
+     * GFW) and returned as "domain=ip1,ip2;domain2=ip3" for connect() to pass
+     * to nativeSetDnsOverride. The OverrideResolver then returns the
+     * pre-resolved IPs directly for these domains, so pkarr resolve (HTTPS to
+     * dns.iroh.link/pkarr/<z32>) and the relay connection succeed.
      */
     private suspend fun resolveIrohDnsOverrides(): String {
-        // iroh presets::N0 使用的 DNS origin + 默认 relay 服务器。
+        // DNS origin and default relay servers used by iroh presets::N0.
         val domains = listOf(
             "dns.iroh.link",
             "use1-1.relay.n0.iroh.link",
@@ -248,8 +263,8 @@ class VpnViewModel : ViewModel() {
     }
 
     /**
-     * 清空并重新添加 domain→node 映射。返回所有需代理的 domain 列表；
-     * 若无任何映射则抛异常。
+     * Clears and re-adds the domain -> node mappings. Returns the list of all
+     * domains that have to be proxied; throws when there is no mapping at all.
      */
     private suspend fun addDomainMappings(): List<String> {
         IrohProxy.nativeClearNodes()
@@ -274,8 +289,9 @@ class VpnViewModel : ViewModel() {
     }
 
     /**
-     * 启动本地代理。先 nativeStopProxy（Rust 侧确定式回收监听端口，无需 delay），
-     * 再按端口递增重试最多 10 次。返回实际监听端口。
+     * Starts the local proxy. nativeStopProxy runs first (Rust releases the
+     * listening port deterministically, no delay needed), then it retries up to
+     * 10 times with an incrementing port. Returns the port actually in use.
      */
     private suspend fun startProxyWithRetries(basePort: Int): Int {
         addLog("Starting proxy...")
@@ -298,11 +314,14 @@ class VpnViewModel : ViewModel() {
     }
 
     /**
-     * 全量释放隧道资源：nativeDestroy（停本地代理 + 释放 iroh endpoint）+ 复位状态 + 停 VPN 服务。
-     * 关键点：复位 isIrohStarted=false，且 nativeDestroy 清掉 endpoint，使下次 connect
-     * 重新执行 nativeStartIroh 建立全新隧道，而非复用旧 endpoint。
-     * 注意：这里用 nativeDestroy 而非 nativeStopProxy——后者只停代理、保留 endpoint，
-     * 供 startProxyWithRetries 重绑端口时使用。
+     * Releases every tunnel resource: nativeDestroy (stops the local proxy and
+     * drops the iroh endpoint) + resets the state + stops the VPN service.
+     * Key point: isIrohStarted is reset to false and nativeDestroy clears the
+     * endpoint, so the next connect runs nativeStartIroh again and builds a
+     * brand new tunnel instead of reusing the old endpoint.
+     * Note: nativeDestroy is used here rather than nativeStopProxy - the latter
+     * only stops the proxy and keeps the endpoint, which is what
+     * startProxyWithRetries needs when it rebinds the port.
      */
     private suspend fun releaseAllResources(context: Context) {
         try {
@@ -324,7 +343,8 @@ class VpnViewModel : ViewModel() {
     fun connect(context: Context) {
         if (isConnecting.value) return
         connectJob = viewModelScope.launch(Dispatchers.IO) {
-            // 与 disconnect 互斥；若 disconnect 正在进行则放弃本次连接。
+            // Mutually exclusive with disconnect; abandon this connect if a
+            // disconnect is already in progress.
             if (!connectionMutex.tryLock()) {
                 addLog("connect: disconnect in progress, aborting")
                 return@launch
@@ -356,27 +376,35 @@ class VpnViewModel : ViewModel() {
                 val basePort = LOCAL_PROXY_PORT
                 var lastError: Exception? = null
 
-                // 重试循环：每次尝试整体超时 ATTEMPT_TIMEOUT_MS；超时/失败后全量释放资源再重试。
+                // Retry loop: every attempt has an overall timeout of
+                // ATTEMPT_TIMEOUT_MS; on timeout or failure all resources are
+                // released before the next attempt.
                 for (attempt in 1..MAX_CONNECT_ATTEMPTS) {
                     try {
                         withTimeout(ATTEMPT_TIMEOUT_MS) {
-                            // 注入系统 DNS 给 iroh，避免 iroh 在 Android 上 JNI 读系统 DNS
-                            // 失败后回落 Google DNS（国内不稳定导致后端连不上）。
-                            // 每次重试都重新获取，因为 releaseAllResources 后网络可能变化。
+                            // Inject the system DNS into iroh so it does not
+                            // fall back to Google DNS after the JNI system-DNS
+                            // read fails on Android (unreliable behind
+                            // restrictive networks, backends unreachable).
+                            // Re-read on every retry because the network may
+                            // have changed after releaseAllResources.
                             val dnsServers = getSystemDnsServers(context)
                             if (dnsServers.isNotEmpty()) {
                                 addLog("Injecting system DNS servers: $dnsServers")
                                 IrohProxy.nativeSetDnsServers(dnsServers)
                             }
-                            // 预解析 iroh 基础设施域名（dns.iroh.link + relay），
-                            // 绕过 GFW 对 iroh.link UDP DNS 响应的阻断。每次重试都重新解析。
+                            // Pre-resolve the iroh infrastructure domains
+                            // (dns.iroh.link + relays) to work around the GFW
+                            // dropping iroh.link UDP DNS responses. Re-resolved
+                            // on every retry.
                             val dnsOverrides = resolveIrohDnsOverrides()
                             if (dnsOverrides.isNotEmpty()) {
                                 IrohProxy.nativeSetDnsOverride(dnsOverrides)
                             }
-                            // 配置 relay 模式
+                            // Configure the relay mode
                             IrohProxy.nativeSetRelayConfig(relayMode.value, relayUrl.value)
-                            // 配置 2FA 凭证（必须在 nativeStartProxy 之前注入）
+                            // Configure the 2FA credentials (must be injected
+                            // before nativeStartProxy)
                             if (twoFactorEnabled.value) {
                                 IrohProxy.nativeSetTwoFactor(
                                     twoFactorClientId.value,
@@ -405,7 +433,7 @@ class VpnViewModel : ViewModel() {
                             }
                         }
 
-                        // 成功：拉起 VPN 前台服务。
+                        // Success: start the VPN foreground service.
                         val allDomains = nodes.value.flatMap { it.domains }
                         val intent = Intent(context, NexaVpnService::class.java).apply {
                             action = NexaVpnService.ACTION_START
@@ -416,11 +444,12 @@ class VpnViewModel : ViewModel() {
                         addLog("VPN connected successfully (attempt $attempt/$MAX_CONNECT_ATTEMPTS)")
                         return@launch
                     } catch (e: TimeoutCancellationException) {
-                        // withTimeout 超时：可重试。
+                        // withTimeout expired: retryable.
                         addLog("Attempt $attempt/$MAX_CONNECT_ATTEMPTS timed out after ${ATTEMPT_TIMEOUT_MS}ms")
                         lastError = e
                     } catch (e: kotlinx.coroutines.CancellationException) {
-                        // disconnect 主动取消：不重试，向上传播以退出循环。
+                        // Deliberate cancellation from disconnect: do not
+                        // retry, propagate to exit the loop.
                         throw e
                     } catch (e: Exception) {
                         addLog("Attempt $attempt/$MAX_CONNECT_ATTEMPTS failed: ${e.message}")
@@ -445,17 +474,21 @@ class VpnViewModel : ViewModel() {
 
     fun disconnect(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
-            // 取消进行中的 connect：JNI 不可中断，但会在下一挂起点抛 CancellationException 退出。
+            // Cancel the in-flight connect: JNI cannot be interrupted, but the
+            // next suspension point throws CancellationException and it exits.
             connectJob?.cancel()
 
-            // 等待 connect 释放互斥锁（其 finally 会 unlock）。预算略大于单次连接超时。
+            // Wait for connect to release the mutex (its finally block unlocks
+            // it). The budget is slightly larger than a single connect timeout.
             val locked = withTimeoutOrNull(DISCONNECT_MUTEX_TIMEOUT_MS) {
                 connectionMutex.withLock {
                     releaseAllResources(context)
                 }
             }
             if (locked == null) {
-                // 极端情况：connect 仍卡在 JNI 超过预算。Rust 侧已无死锁，直接强制释放。
+                // Edge case: connect is still stuck in JNI past the budget.
+                // There is no deadlock on the Rust side anymore, so force the
+                // release.
                 addLog("disconnect: could not acquire mutex within ${DISCONNECT_MUTEX_TIMEOUT_MS}ms, forcing release")
                 releaseAllResources(context)
             }
@@ -534,12 +567,13 @@ class VpnViewModel : ViewModel() {
     }
 
     /**
-     * 将 ViewModel 的 isVpnRunning 与 NexaVpnService 的实际状态同步。
+     * Syncs the ViewModel's isVpnRunning with the actual NexaVpnService state.
      *
-     * 场景：Activity/ViewModel 被重建（进程部分恢复、开发者选项等）后，
-     * isVpnRunning 默认为 false，但 VPN 服务可能仍在前台运行。
-     * 调用此方法可将 UI 状态与实际服务状态对齐，避免显示 "Disconnected"
-     * 而实际隧道仍可用的不一致。
+     * Scenario: after the Activity/ViewModel is recreated (partial process
+     * restore, developer options, ...), isVpnRunning defaults to false while
+     * the VPN service may still be running in the foreground. Calling this
+     * aligns the UI state with the real service state, so the UI cannot show
+     * "Disconnected" while the tunnel is actually usable.
      */
     fun syncVpnServiceState() {
         if (!isVpnRunning.value && !isConnecting.value && NexaVpnService.isServiceActive) {

@@ -39,7 +39,7 @@ class SettingsManager(context: Context) {
         }
     }
 
-    /** 保存 relay 配置 */
+    /** Saves the relay configuration. */
     fun saveRelayConfig(relayMode: String, relayUrl: String, forceRelay: Boolean) {
         prefs.edit()
             .putString(KEY_RELAY_MODE, relayMode)
@@ -48,22 +48,22 @@ class SettingsManager(context: Context) {
             .apply()
     }
 
-    /** 加载 relay 模式，默认 "pinned"（固定到 aps1-1） */
+    /** Loads the relay mode; defaults to "pinned" (pinned to aps1-1). */
     fun loadRelayMode(): String {
         return prefs.getString(KEY_RELAY_MODE, "pinned") ?: "pinned"
     }
 
-    /** 加载自定义 relay URL */
+    /** Loads the custom relay URL. */
     fun loadRelayUrl(): String {
         return prefs.getString(KEY_RELAY_URL, "") ?: ""
     }
 
-    /** 加载是否强制使用 relay（禁用直连） */
+    /** Loads whether relaying is forced (direct connections disabled). */
     fun loadForceRelay(): Boolean {
         return prefs.getBoolean(KEY_FORCE_RELAY, false)
     }
 
-    /** 保存 2FA 配置 */
+    /** Saves the 2FA configuration. */
     fun saveTwoFactorConfig(
         enabled: Boolean,
         clientId: String,
@@ -78,22 +78,22 @@ class SettingsManager(context: Context) {
             .apply()
     }
 
-    /** 加载是否启用 2FA，默认关闭 */
+    /** Loads whether 2FA is enabled; defaults to false. */
     fun loadTwoFactorEnabled(): Boolean {
         return prefs.getBoolean(KEY_2FA_ENABLED, false)
     }
 
-    /** 加载 2FA 客户端 ID */
+    /** Loads the 2FA client ID. */
     fun loadTwoFactorClientId(): String {
         return prefs.getString(KEY_2FA_CLIENT_ID, "") ?: ""
     }
 
-    /** 加载 2FA TOTP Secret（Base32） */
+    /** Loads the 2FA TOTP secret (Base32). */
     fun loadTwoFactorSecret(): String {
         return prefs.getString(KEY_2FA_SECRET, "") ?: ""
     }
 
-    /** 加载 2FA 算法，默认 sha1 */
+    /** Loads the 2FA algorithm; defaults to sha1. */
     fun loadTwoFactorAlgorithm(): String {
         return prefs.getString(KEY_2FA_ALGORITHM, "sha1") ?: "sha1"
     }

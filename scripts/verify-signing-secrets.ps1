@@ -1,27 +1,35 @@
 ﻿<#
 .SYNOPSIS
-    本地预检 release APK 的签名 secrets，避免把错误的值填进 GitHub Secrets。
+    Pre-flight check for the release APK signing secrets, so that wrong values
+    are not pasted into GitHub Secrets.
 
 .DESCRIPTION
-    做三件事：
-      1. 检查 *.jks.base64 文件本身是否适合填入 GitHub Secret（单行、无 BOM、无空白）；
-      2. 在内存里解码，校验文件头是密钥库、算出 sha256；
-      3. 调用 keytool 用密码/别名真正读一次，确认三个密码类 secret 是对的。
+    Does three things:
+     1. Checks whether the *.jks.base64 file itself is suitable for a GitHub
+        Secret (single line, no BOM, no whitespace);
+     2. Decodes it in memory, verifies that the file header is a keystore and
+        computes its sha256;
+     3. Calls keytool with the password/alias and actually reads the keystore
+        once, confirming that the three password secrets are correct.
 
-    输出的「sha256 / 字节数」可以直接和 CI 日志里 “签名库校验” 那一段比对：
-    两边一致，就说明 GitHub Secret 里存的值与本地这把钥匙完全一致。
+    The "sha256 / byte count" printed here can be compared directly with the
+    "keystore verification" section of the CI log: when both match, the value
+    stored in the GitHub Secret is exactly the same key as the local one.
 
 .PARAMETER Base64File
-    base64 文件路径，默认 ~/.nexapipe-signing/nexapipe-release.jks.base64
+    Path to the base64 file; defaults to
+    ~/.nexapipe-signing/nexapipe-release.jks.base64
 
 .PARAMETER PasswordFile
-    密码文件路径，默认 ~/.nexapipe-signing/keystore-password.txt
+    Path to the password file; defaults to
+    ~/.nexapipe-signing/keystore-password.txt
 
 .PARAMETER Alias
-    key 别名，默认 nexapipe
+    Key alias; defaults to nexapipe
 
 .PARAMETER ShowValue
-    额外把 base64 内容原样打印出来（很长），仅在需要手工粘贴时使用。
+    Also prints the base64 content verbatim (it is long); only needed when
+    pasting it by hand.
 #>
 [CmdletBinding()]
 param(
@@ -51,93 +59,93 @@ function Find-Keytool {
     return $null
 }
 
-Write-Host "nexapipe 签名 secrets 预检" -ForegroundColor White
+Write-Host "nexapipe signing secrets pre-flight check" -ForegroundColor White
 
-# ---- 1. 输入文件 -------------------------------------------------------------
-Write-Step "检查 base64 文件"
+# ---- 1. Input file ---------------------------------------------------------
+Write-Step "Checking the base64 file"
 if (-not (Test-Path -LiteralPath $Base64File)) {
-    Write-Bad "找不到 $Base64File"
+    Write-Bad "Not found: $Base64File"
     exit 1
 }
 $fi = Get-Item -LiteralPath $Base64File
-Write-Ok ("文件: {0} ({1} 字节)" -f $fi.FullName, $fi.Length)
+Write-Ok ("File: {0} ({1} bytes)" -f $fi.FullName, $fi.Length)
 
 $raw = [IO.File]::ReadAllBytes($Base64File)
 $problems = @()
 if ($raw.Length -ge 3 -and $raw[0] -eq 0xEF -and $raw[1] -eq 0xBB -and $raw[2] -eq 0xBF) {
-    $problems += "文件带 UTF-8 BOM，粘贴到 GitHub Secret 时可能被一起带进去"
+    $problems += "The file has a UTF-8 BOM, which may be pasted into the GitHub Secret along with the content"
 }
 $text = [Text.Encoding]::ASCII.GetString($raw)
 $crlf = ($text -split "`n").Count - 1
 if ($crlf -gt 3) {
-    $problems += "内容被折成 $($crlf+1) 行，粘贴时容易被截断（CI 现在能容忍换行，但仍建议单行）"
+    $problems += "The content is wrapped over $($crlf+1) lines and may be truncated when pasted (CI tolerates newlines now, but a single line is still recommended)"
 }
 $b64 = $text -replace '\s', ''
 $b64 = $b64.Trim([char]0x22, [char]0x60, [char]0x27)
 if ($b64 -notmatch '^[A-Za-z0-9+/]+={0,2}$') {
-    $problems += "含有非 base64 字符，粘贴时可能混进了别的内容"
+    $problems += "Contains non-base64 characters; something else may have been mixed in when pasting"
 }
-# $b64 首字符合法性
-if ($b64.Length -eq 0) { Write-Bad "文件为空"; exit 1 }
+# Sanity-check the leading characters of $b64
+if ($b64.Length -eq 0) { Write-Bad "The file is empty"; exit 1 }
 
 if ($problems.Count) {
     foreach ($p in $problems) { Write-Warn $p }
 } else {
-    Write-Ok "内容为干净的 base64 单行"
+    Write-Ok "The content is a clean single-line base64 string"
 }
-Write-Ok ("清理后长度 {0} 个字符，前 8 位 '{1}'" -f $b64.Length, $b64.Substring(0, [Math]::Min(8, $b64.Length)))
+Write-Ok ("Length after cleanup: {0} characters, first 8: '{1}'" -f $b64.Length, $b64.Substring(0, [Math]::Min(8, $b64.Length)))
 if ($b64 -notlike "MII*") {
-    Write-Warn "标准 PKCS12 密钥库的 base64 通常以 'MII' 开头，这里不是，请确认没弄错文件"
+    Write-Warn "The base64 of a standard PKCS12 keystore usually starts with 'MII'; this one does not, please double-check the file"
 }
 
-# ---- 2. 解码 + 结构校验 -----------------------------------------------------
-Write-Step "解码并校验密钥库结构"
+# ---- 2. Decode + structural check ------------------------------------------
+Write-Step "Decoding and verifying the keystore structure"
 try {
     $bytes = [Convert]::FromBase64String($b64)
 } catch {
-    Write-Bad "base64 解码失败: $($_.Exception.Message)"
+    Write-Bad "base64 decoding failed: $($_.Exception.Message)"
     exit 1
 }
 $magic = ($bytes[0..3] | ForEach-Object { $_.ToString("x2") }) -join ''
 $sha = ([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes))).Replace('-', '').ToLower()
 
-Write-Ok ("解码后 {0} 字节，文件头 0x{1}" -f $bytes.Length, $magic)
+Write-Ok ("Decoded {0} bytes, file header 0x{1}" -f $bytes.Length, $magic)
 Write-Ok ("sha256 {0}" -f $sha)
 
 $magicOk = $magic.StartsWith("3082") -or $magic.StartsWith("30") -or $magic -eq "feedfeed"
 if (-not $magicOk) {
-    Write-Bad "文件头 0x$magic 不是密钥库（期望 0x3082… PKCS12 / 0x30… DER / 0xfeedfeed JKS）"
-    Write-Host "       解码后开头是这样：" -ForegroundColor DarkGray
+    Write-Bad "File header 0x$magic is not a keystore (expected 0x3082... PKCS12 / 0x30... DER / 0xfeedfeed JKS)"
+    Write-Host "       The decoded content starts with:" -ForegroundColor DarkGray
     $preview = [Text.Encoding]::ASCII.GetString($bytes[0..([Math]::Min(47, $bytes.Length - 1))])
     Write-Host ("       {0}" -f ($preview -replace '[^\x20-\x7e]', '.')) -ForegroundColor DarkGray
     exit 1
 }
-if ($bytes.Length -lt 1000) { Write-Bad "只有 $($bytes.Length) 字节，明显不完整"; exit 1 }
+if ($bytes.Length -lt 1000) { Write-Bad "Only $($bytes.Length) bytes, obviously incomplete"; exit 1 }
 
-# ---- 3. keytool 实测密码/别名 ------------------------------------------------
-Write-Step "用 keytool 验证密码与别名"
+# ---- 3. Verify the password/alias with keytool -----------------------------
+Write-Step "Verifying the password and alias with keytool"
 $keytool = Find-Keytool
 if (-not $keytool) {
-    Write-Warn "找不到 keytool，跳过该步（把 JDK 的 bin 加进 PATH 再跑一次）"
+    Write-Warn "keytool not found, skipping this step (add the JDK bin directory to PATH and run again)"
 } else {
     $pw = $null
     if (Test-Path -LiteralPath $PasswordFile) {
         $pw = ([IO.File]::ReadAllText($PasswordFile)).Trim()
     }
     if (-not $pw) {
-        Write-Warn "读不到密码文件 $PasswordFile，跳过（可用 -PasswordFile 指定）"
+        Write-Warn "Cannot read the password file $PasswordFile, skipping (use -PasswordFile to specify one)"
     } else {
         $tmp = Join-Path $env:TEMP ("nexapipe-preflight-{0}.jks" -f ([Guid]::NewGuid().ToString("N").Substring(0, 8)))
         [IO.File]::WriteAllBytes($tmp, $bytes)
         try {
             $out = & $keytool -list -keystore $tmp -storepass $pw -alias $Alias 2>&1
             if ($LASTEXITCODE -eq 0) {
-                Write-Ok "keytool 读取成功，别名 $Alias 存在，密码正确"
+                Write-Ok "keytool read succeeded: alias $Alias exists and the password is correct"
                 if ($out -match 'SHA256:\s*([0-9A-F:]+)') {
-                    Write-Ok ("证书指纹 SHA256: {0}" -f $Matches[1])
+                    Write-Ok ("Certificate fingerprint SHA256: {0}" -f $Matches[1])
                 }
             } else {
-                Write-Bad "keytool 失败（密码或别名不对）:"
+                Write-Bad "keytool failed (wrong password or alias):"
                 $out | ForEach-Object { Write-Host "       $_" -ForegroundColor DarkGray }
                 exit 1
             }
@@ -147,27 +155,30 @@ if (-not $keytool) {
     }
 }
 
-# ---- 4. 与 CI 比对 ----------------------------------------------------------
-Write-Step "填写 GitHub Secret 并比对"
+# ---- 4. Compare against CI -------------------------------------------------
+Write-Step "Fill in the GitHub Secret and compare"
 Write-Host @"
-  1) 打开 https://github.com/yixinin/nexapipe-android/settings/secrets/actions
-     编辑 RELEASE_KEYSTORE_BASE64，粘贴的内容必须与下面这条命令输出【逐字一致】。
-     推荐用 notepad 打开后 Ctrl+A / Ctrl+C，避免终端折行或提示符混入：
+  1) Open https://github.com/yixinin/nexapipe-android/settings/secrets/actions
+     Edit RELEASE_KEYSTORE_BASE64; the pasted content must be identical,
+     character for character, to the output of this command.
+     Opening the file with notepad and pressing Ctrl+A / Ctrl+C is recommended,
+     so that terminal line wrapping or a prompt is not mixed in:
 
          notepad "$($fi.FullName)"
 
-  2) 另外三个 secret：
-         RELEASE_KEYSTORE_PASSWORD = keystore-password.txt 的内容
+  2) The other three secrets:
+         RELEASE_KEYSTORE_PASSWORD = contents of keystore-password.txt
          RELEASE_KEY_ALIAS         = $Alias
-         RELEASE_KEY_PASSWORD      = keystore-password.txt 的内容
+         RELEASE_KEY_PASSWORD      = contents of keystore-password.txt
 
-  3) 到 Actions 里 Run workflow，勾选 "signing_only"，约 1 分钟出结果。
-     日志中「签名库校验」的 sha256 必须等于：
+  3) Go to Actions, run the workflow and check "signing_only"; the result
+     appears in about 1 minute.
+     The sha256 in the "keystore verification" section of the log must equal:
 
          $sha
 "@ -ForegroundColor Gray
 
 if ($ShowValue) {
-    Write-Step "base64 原文"
+    Write-Step "Raw base64 content"
     Write-Host $b64
 }

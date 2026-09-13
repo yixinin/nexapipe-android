@@ -22,8 +22,9 @@ class MainActivity : ComponentActivity() {
             val viewModel: VpnViewModel = viewModel()
             viewModel.initSettings(this)
             viewModel.loadSettings()
-            // 同步 UI 状态：Activity 重建后 ViewModel 的 isVpnRunning 可能为 false，
-            // 但 VPN 服务仍在运行。通过检查服务级标志恢复正确的 UI 状态。
+            // Sync UI state: after the activity is recreated, the ViewModel's
+            // isVpnRunning may be false while the VPN service is still running.
+            // Check the service-level flag to restore the correct UI state.
             viewModel.syncVpnServiceState()
             NexaTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->

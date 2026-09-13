@@ -27,13 +27,17 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 
 /**
- * VPN 服务：创建 TUN 接口并将 fd 传给 Rust 侧的 smoltcp TUN 代理。
+ * VPN service: creates the TUN interface and hands the fd over to the smoltcp
+ * TUN proxy on the Rust side.
  *
- * 原 ~1600 行手写 TCP/IP 栈已删除，替换为 Rust netstack-smoltcp 用户态栈。
- * Kotlin 侧只负责：VPN 建立、网络回调、前台服务、传递 TUN fd 给 Rust。
+ * The original ~1600-line hand-written TCP/IP stack has been removed and
+ * replaced by the Rust netstack-smoltcp userspace stack. The Kotlin side is
+ * only responsible for establishing the VPN, network callbacks, the foreground
+ * service, and passing the TUN fd to Rust.
  *
- * 数据流：APP → TUN fd → Rust(smoltcp) → handle_local_connection → iroh → 后端
- * DNS 劫持、TCP MSS/重传/FIN-ACK 全部在 Rust 侧处理。
+ * Data flow: APP -> TUN fd -> Rust(smoltcp) -> handle_local_connection ->
+ * iroh -> backend. DNS hijacking and TCP MSS / retransmit / FIN-ACK handling
+ * are all done on the Rust side.
  */
 class NexaVpnService : VpnService() {
     private val TAG = "NexaVpnService"
@@ -47,23 +51,29 @@ class NexaVpnService : VpnService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var isUserStarted = false
 
-    // 网络切换重连：记录重连任务与互斥，避免并发 native 调用竞态。
+    // Reconnect on network switch: keeps the reconnect job and its mutex so
+    // that concurrent native calls cannot race.
     private var reconnectJob: Job? = null
     @Volatile private var reconnectInProgress = false
-    // TUN 代理是否已成功启动（仅在此为 true 时才对网络切换触发重连，
-    // 避免在初始建立 VPN 的过程中误触发）。
+    // Whether the TUN proxy has started successfully. A network switch only
+    // triggers a reconnect when this is true, so the initial VPN setup cannot
+    // trigger one by accident.
     @Volatile private var tunProxyStarted = false
     private val reconnectMutex = Any()
 
-    // TUN 子网配置（必须与 Rust tun_proxy.rs 的虚拟 IP 常量一致）
+    // TUN subnet configuration (must match the virtual IP constants in Rust
+    // tun_proxy.rs)
     private val virtualDNSIP = "10.0.1.2"
     private val tunInterfaceIP = "10.0.1.1"
-    // virtualProxyIP(10.0.1.3) 在 Rust 侧硬编码，这里不需要——DNS 响应由 Rust 构造，
-    // TCP 分流由 Rust 按 local_addr.ip() 判断。
+    // virtualProxyIP (10.0.1.3) is hardcoded on the Rust side and not needed
+    // here: DNS responses are built by Rust, and TCP traffic is split by Rust
+    // according to local_addr.ip().
     //
-    // 注意：不要劫持系统 captive portal 校验域名（connectivitycheck.gstatic.com 等）到
-    // 私有 IP。Android 的 NetworkMonitor 会把"校验域名解析到私有 IP"判定为无互联网，
-    // 导致状态栏 WiFi 感叹号。让它们走真实 DNS、连物理网络即可。
+    // Note: do not hijack the system captive-portal check domains
+    // (connectivitycheck.gstatic.com and friends) to a private IP. Android's
+    // NetworkMonitor treats "the check domain resolves to a private IP" as "no
+    // internet", which puts an exclamation mark on the Wi-Fi icon in the status
+    // bar. Let them use real DNS over the physical network instead.
 
     override fun onCreate() {
         super.onCreate()
@@ -88,11 +98,14 @@ class NexaVpnService : VpnService() {
             return
         }
 
-        // ACTION_START 表示 VpnViewModel 要求重新建立 VPN（含新 TUN fd）。
-        // nativeStopProxy（connect 流程中 startProxyWithRetries 调用）已停掉了
-        // Rust 侧 TUN 代理，但 isRunning 可能仍为 true（VPN 服务未被 stopVPN 停止）。
-        // 必须重置 isRunning，否则 establishVPN 会因 "VPN already running" 跳过，
-        // 导致 TUN 代理永远不会重建 → 数据平面死掉（表现为 "连上就断"）。
+        // ACTION_START means VpnViewModel wants the VPN re-established (with a
+        // new TUN fd). nativeStopProxy (called by startProxyWithRetries during
+        // connect) already stopped the Rust TUN proxy, but isRunning may still
+        // be true because the service was never stopped through stopVPN.
+        // isRunning must be reset, otherwise establishVPN bails out with
+        // "VPN already running" and the TUN proxy is never rebuilt -> the data
+        // plane is dead (it looks like the connection drops right after
+        // connecting).
         synchronized(this@NexaVpnService) {
             if (isRunning) {
                 Log.d(TAG, "startVPN: resetting isRunning (TUN proxy was stopped by nativeStopProxy)")
@@ -100,7 +113,7 @@ class NexaVpnService : VpnService() {
                 tunProxyStarted = false
             }
         }
-        // 取消可能挂起的网络切换重连，避免与新的建立流程竞态。
+        // Cancel any pending reconnect so it cannot race with the new setup.
         reconnectJob?.cancel()
         reconnectJob = null
 
@@ -128,20 +141,23 @@ class NexaVpnService : VpnService() {
         isUserStarted = false
         tunProxyStarted = false
         isServiceActive = false
-        // 取消进行中的网络切换重连，避免与手动断开竞态。
+        // Cancel an in-flight reconnect so it cannot race with this manual
+        // disconnect.
         reconnectJob?.cancel()
         reconnectJob = null
 
-        // 先停 TUN 代理（abort smoltcp 任务 + 关闭 dup 的 fd → VPN 自动拆除）
-        // 必须在 vpnInterface 处理之前调用，因为 fd 所有权已转给 Rust。
+        // Stop the TUN proxy first (abort the smoltcp task + close the
+        // duplicated fd -> the VPN is torn down automatically).
+        // Must run before touching vpnInterface, because fd ownership has been
+        // transferred to Rust.
         try {
             IrohProxy.nativeStopTunProxy()
         } catch (e: Exception) {
             Log.e(TAG, "nativeStopTunProxy failed: ${e.message}")
         }
 
-        // vpnInterface 已 detachFd，fd 所有权在 Rust 侧，不能再 close()
-        // 只需清除引用
+        // vpnInterface already went through detachFd, so the fd is owned by
+        // Rust and must not be closed here. Just drop the reference.
         vpnInterface = null
 
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -165,20 +181,23 @@ class NexaVpnService : VpnService() {
     }
 
     /**
-     * 建立 VPN + TUN 代理。可被初始建立与网络切换重连复用。
-     * @return true 成功；false 失败（失败时由调用方处理 isRunning 状态）。
+     * Establishes the VPN and the TUN proxy. Shared by the initial setup and
+     * by the reconnect after a network switch.
+     * @return true on success; false on failure (the caller then handles the
+     *         isRunning state).
      */
     private suspend fun establishVpnInternal(): Boolean {
         return try {
             val builder = Builder()
                 .setSession("Nexa VPN")
                 .addAddress(tunInterfaceIP, 24)
-                // 只路由虚拟 IP 段 (10.0.1.0/24)
-                // DNS 查询（到 10.0.1.2:53）走 TUN
-                // TCP 代理流量（到 10.0.1.3:80/443）走 TUN
+                // Route only the virtual IP range (10.0.1.0/24):
+                // DNS queries (to 10.0.1.2:53) go through the TUN,
+                // TCP proxy traffic (to 10.0.1.3:80/443) goes through the TUN.
                 .addRoute("10.0.1.0", 24)
                 .addDnsServer(virtualDNSIP)
-                // 排除自身 APP 流量，确保代理连接走物理网络
+                // Exclude this app's own traffic so proxy connections use the
+                // physical network.
                 .addDisallowedApplication(packageName)
 
             val selectedNetwork = underlyingNetwork
@@ -199,9 +218,10 @@ class NexaVpnService : VpnService() {
                 return false
             }
 
-            // 将 TUN fd 所有权转移给 Rust（detachFd 后 PFD 不再可用）
+            // Transfer TUN fd ownership to Rust (the PFD is no longer usable
+            // after detachFd).
             val fd = vpnInterface!!.detachFd()
-            vpnInterface = null  // PFD 已失效，清除引用
+            vpnInterface = null  // the PFD is invalid now, drop the reference
 
             val proxyDomainsStr = allowedDomains.joinToString(",")
 
@@ -227,7 +247,8 @@ class NexaVpnService : VpnService() {
 
             if (result != 0) {
                 Log.e(TAG, "Failed to start TUN proxy: $result, closing fd")
-                // nativeStartTunProxy 失败时 fd 未被 Rust 接管，需手动关闭
+                // When nativeStartTunProxy fails Rust never took ownership of
+                // the fd, so close it here.
                 try {
                     ParcelFileDescriptor.adoptFd(fd).close()
                 } catch (_: Exception) {}
@@ -249,7 +270,7 @@ class NexaVpnService : VpnService() {
     }
 
     // ============================================================
-    // 网络回调 — 检测 underlyingNetwork（WiFi/蜂窝）
+    // Network callbacks - track the underlyingNetwork (Wi-Fi / cellular)
     // ============================================================
 
     private fun registerNetworkCallback() {
@@ -270,9 +291,11 @@ class NexaVpnService : VpnService() {
             }
         }
 
-        // 不要求 NET_CAPABILITY_VALIDATED：国内运营商常劫持 connectivitycheck
-        // 导致 WiFi 无法 validated → onAvailable 不触发 → underlyingNetwork 始终 null。
-        // 不劫持系统联网校验域名；它们仍通过真实物理网络校验。
+        // NET_CAPABILITY_VALIDATED is deliberately not required: carriers often
+        // hijack the connectivity check, so Wi-Fi may never be validated ->
+        // onAvailable is never called -> underlyingNetwork stays null. We do not
+        // hijack the system connectivity-check domains either; they are still
+        // validated over the real physical network.
         val request = NetworkRequest.Builder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .build()
@@ -307,11 +330,13 @@ class NexaVpnService : VpnService() {
     }
 
     // ============================================================
-    // 网络切换重连 — 底层网络（WiFi/蜂窝）变化时重建整条隧道
+    // Network-switch reconnect - rebuild the whole tunnel when the
+    // underlying network (Wi-Fi / cellular) changes
     // ============================================================
 
     private fun onUnderlyingNetworkChanged(reason: String) {
-        // 仅在用户已启动且 TUN 代理已建立时触发，避免初始建立过程误触发。
+        // Only trigger once the user has started the VPN and the TUN proxy is
+        // up, so the initial setup cannot trigger it by accident.
         if (!isUserStarted || !isRunning || !tunProxyStarted) {
             Log.d(TAG, "Network change ignored ($reason): session not fully up")
             return
@@ -321,7 +346,8 @@ class NexaVpnService : VpnService() {
     }
 
     private fun scheduleReconnect() {
-        // 防抖：连续的 onLost/onAvailable 只保留最后一次，并给新网络一点稳定时间。
+        // Debounce: consecutive onLost/onAvailable collapse into the last one,
+        // and the new network gets a moment to settle.
         reconnectJob?.cancel()
         reconnectJob = serviceScope.launch {
             delay(RECONNECT_DEBOUNCE_MS)
@@ -336,7 +362,8 @@ class NexaVpnService : VpnService() {
             reconnectInProgress = true
         }
         try {
-            // 切换尚未完成（如进了飞行模式）：等下一个网络事件再触发。
+            // The switch is not finished yet (e.g. airplane mode was turned
+            // on): wait for the next network event.
             if (underlyingNetwork == null) {
                 Log.d(TAG, "Reconnect: no underlying network yet, skipping")
                 return
@@ -360,7 +387,8 @@ class NexaVpnService : VpnService() {
                     lastError = e
                     Log.e(TAG, "Reconnect attempt $attempt/$MAX_RECONNECT_ATTEMPTS timed out")
                 } catch (e: kotlinx.coroutines.CancellationException) {
-                    // 手动断开/服务销毁主动取消：不重试。
+                    // Deliberate cancellation from a manual disconnect or
+                    // service destruction: do not retry.
                     throw e
                 } catch (e: Exception) {
                     lastError = e
@@ -371,34 +399,41 @@ class NexaVpnService : VpnService() {
                 }
             }
             Log.e(TAG, "Reconnect: all attempts failed: ${lastError?.message}")
-            // 保留服务运行；Rust 侧请求级重试会兜底，下次网络变化再触发重连。
+            // Keep the service running: request-level retries on the Rust side
+            // act as a safety net, and the next network change triggers another
+            // reconnect.
         } finally {
             synchronized(reconnectMutex) { reconnectInProgress = false }
         }
     }
 
     /**
-     * 重建隧道：停旧 TUN 代理 → 用新 underlying network 重建 VPN + TUN 代理。
+     * Rebuilds the tunnel: stop the old TUN proxy -> re-establish the VPN and
+     * the TUN proxy on the new underlying network.
      *
-     * iroh endpoint / 本地代理保持不动：iroh 自带路径迁移与 relay 重连，
-     * 连接池会按需新建后端连接。不要销毁重建 endpoint——那会带来数秒到数十秒
-     * 的断线窗口（nativeStartIroh 弱网下可阻塞 30s），并可能在重建失败时
-     * 把隧道留在不可用状态。
+     * The iroh endpoint and the local proxy are left untouched: iroh handles
+     * path migration and relay reconnection itself, and the connection pool
+     * opens new backend connections on demand. Do not destroy and recreate the
+     * endpoint - that opens an outage window of seconds to tens of seconds
+     * (nativeStartIroh can block for 30s on a weak network) and may leave the
+     * tunnel unusable if the rebuild fails.
      */
     private suspend fun rebuildTunnel() {
-        // 1. 停旧 TUN 代理（关闭 dup fd → 旧 VPN 自动拆除）
+        // 1. Stop the old TUN proxy (closes the duplicated fd -> the old VPN is
+        //    torn down automatically).
         runCatching { IrohProxy.nativeStopTunProxy() }
             .onFailure { Log.e(TAG, "Reconnect: nativeStopTunProxy failed: ${it.message}") }
         tunProxyStarted = false
 
-        // 2. 重建 VPN（新 TUN fd + 新 underlying network）并启动 TUN 代理。
+        // 2. Re-establish the VPN (new TUN fd + new underlying network) and
+        //    start the TUN proxy.
         if (!establishVpnInternal()) {
             throw Exception("Reconnect: failed to re-establish VPN/TUN proxy")
         }
     }
 
     // ============================================================
-    // 通知
+    // Notifications
     // ============================================================
 
     private fun createNotificationChannel() {
@@ -444,16 +479,17 @@ class NexaVpnService : VpnService() {
         const val ACTION_STOP = "com.nexa.pipe.vpn.ACTION_STOP"
         const val EXTRA_DOMAINS = "com.nexa.pipe.vpn.EXTRA_DOMAINS"
 
-        // 网络切换重连参数
+        // Network-switch reconnect parameters
         private const val RECONNECT_DEBOUNCE_MS = 1_500L
         private const val MAX_RECONNECT_ATTEMPTS = 3
         private const val RECONNECT_ATTEMPT_TIMEOUT_MS = 60_000L
         private const val RECONNECT_BACKOFF_MS = 2_000L
 
         /**
-         * 进程级标志：VPN 服务是否处于活动状态（TUN 代理已建立）。
-         * 用于 ViewModel 在 Activity 重建后同步 UI 状态，避免 UI 显示 "Disconnected"
-         * 但 VPN 服务实际仍在运行的不一致。
+         * Process-level flag: whether the VPN service is active (the TUN proxy
+         * has been established). Used by the ViewModel to sync the UI state
+         * after the activity is recreated, so the UI cannot show
+         * "Disconnected" while the VPN service is actually still running.
          */
         @Volatile
         @JvmStatic

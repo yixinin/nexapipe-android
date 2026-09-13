@@ -64,8 +64,9 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     var showTwoFactorSettings by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(true) }
 
-    // 每次组合进入可见区域时同步 VPN 服务状态，
-    // 覆盖 Activity 重建以外的场景（如从其他页面导航返回）。
+    // Sync the VPN service state whenever this composable becomes visible,
+    // covering cases beyond activity recreation (e.g. navigating back from
+    // another screen).
     LaunchedEffect(Unit) {
         viewModel.syncVpnServiceState()
     }
