@@ -27,3 +27,9 @@ nexa_vpn_log.txt
 
 # Debug notes
 debug-*.md
+
+# Signing — 绝不入库
+*.jks
+*.keystore
+keystore.properties
+.workbuddy
